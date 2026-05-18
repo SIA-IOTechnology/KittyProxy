@@ -1,0 +1,37 @@
+# KittyProxy — marketplace UI extension manifest
+
+id = "kittyproxy"
+name = "KittyProxy"
+version = "0.1.0"
+description = "HTTP/HTTPS intercepting proxy with web UI for KittySploit"
+author = "KittySploit Team"
+
+extension_type = "UI"
+entry_point = "src/main.py"
+
+[compatibility]
+kittysploit_min = "1.0.0"
+
+[permissions]
+network_access = true
+database_access = true
+sandbox_level = "standard"
+allowed_imports = [
+    "mitmproxy",
+    "uvicorn",
+    "fastapi",
+    "starlette",
+    "requests",
+    "asyncio",
+    "websockets",
+]
+blocked_imports = []
+hooks = []
+events = []
+middlewares = []
+
+[metadata]
+price = 0.0
+currency = "EUR"
+license = "MIT"
+repository = "https://github.com/SIA-IOTechnology/KittyProxy"
