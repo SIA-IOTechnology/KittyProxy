@@ -386,6 +386,49 @@ class FlowManager:
             result["response"] = bodies.get("response")
             return result
 
+    def get_security_flows(self, flow_ids: Optional[List[str]] = None, limit: int = 500) -> List[Dict]:
+        """Return detailed flow snapshots enriched for browser-security analysis.
+
+        Unlike the regular serialized flow, this preserves every Set-Cookie
+        header so cookie attributes can be assessed independently.
+        """
+        safe_limit = max(1, min(int(limit or 500), 2000))
+        with self._lock:
+            live_ids = list(reversed(list(self.flows.keys())))
+            imported_ids = sorted(
+                self.imported_pcap_flows.keys(),
+                key=lambda fid: (self.imported_pcap_flows[fid].get("timestamp_start") or 0),
+                reverse=True,
+            )
+            available = live_ids + [fid for fid in imported_ids if fid not in self.flows]
+            if flow_ids:
+                requested = {str(fid) for fid in flow_ids if fid}
+                selected_ids = [fid for fid in available if fid in requested][:safe_limit]
+            else:
+                selected_ids = available[:safe_limit]
+            raw_flows = {fid: self.flows.get(fid) for fid in selected_ids}
+
+        snapshots: List[Dict] = []
+        for flow_id in selected_ids:
+            detail = self.get_flow(flow_id)
+            if not detail:
+                continue
+            raw_flow = raw_flows.get(flow_id)
+            response = detail.get("response")
+            if raw_flow is not None and raw_flow.response is not None and isinstance(response, dict):
+                try:
+                    values = raw_flow.response.headers.get_all("set-cookie")
+                except Exception:
+                    value = raw_flow.response.headers.get("set-cookie")
+                    values = [value] if value else []
+                response["set_cookie_headers"] = [
+                    value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+                    for value in values
+                    if value
+                ]
+            snapshots.append(detail)
+        return snapshots
+
     def toggle_intercept(self, enabled: bool):
         self.intercept_enabled = enabled
 
@@ -995,6 +1038,11 @@ class FlowManager:
             self.imported_pcap_flows.clear()
             self.pending_intercepts.clear()
             self.intercept_queue.clear()
+        try:
+            from .security_workbench import security_workbench
+            security_workbench.clear()
+        except Exception:
+            pass
     
     def remove_flows_out_of_scope(self) -> int:
         """Remove all flows that don't match the current scope configuration."""

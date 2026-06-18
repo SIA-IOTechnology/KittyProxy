@@ -10,7 +10,9 @@ from .fuzzer import create_fuzz_job, get_fuzz_job_status, get_fuzz_job_results, 
 from .ui_extensions.manager import list_extensions, get_extension_path
 from .performance_monitor import performance_monitor
 from .collaboration_manager import collaboration_manager, Collaborator
+from .local_ai_service import analyze_flow as local_ai_analyze, check_availability as local_ai_status, load_ai_config
 from .tech_detector import tech_detector
+from .security_workbench import security_workbench
 from mitmproxy.http import HTTPFlow, Request, Response
 from mitmproxy import connection
 from starlette.requests import Request as StarletteRequest
@@ -23,6 +25,7 @@ import threading
 import io
 import contextlib
 import json
+import base64
 import asyncio
 import time
 import uuid
@@ -2200,6 +2203,180 @@ def get_discovered_endpoints():
         raise HTTPException(status_code=500, detail=f"Error getting endpoints: {str(e)}")
 
 
+# === BROWSER SECURITY WORKBENCH ===
+def _security_workbench_flows(body: Optional[Dict] = None) -> List[Dict]:
+    body = body or {}
+    flow_ids = body.get("flow_ids")
+    if flow_ids is not None and not isinstance(flow_ids, list):
+        raise HTTPException(status_code=400, detail="flow_ids must be a list")
+    try:
+        limit = max(1, min(int(body.get("limit", 500)), 2000))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit must be an integer")
+    return flow_manager.get_security_flows(flow_ids=flow_ids, limit=limit)
+
+
+@app.get("/api/security-workbench/report")
+def get_security_workbench_report():
+    """Return the most recent workbench report without triggering another scan."""
+    report = security_workbench.get_last_report()
+    return {"status": "empty", "report": None} if report is None else report
+
+
+@app.post("/api/security-workbench/analyze")
+def analyze_security_workbench(body: Dict):
+    """Analyze captured browser/API flows for browser-facing security controls."""
+    flows = _security_workbench_flows(body)
+    categories = body.get("categories")
+    if categories is not None and not isinstance(categories, list):
+        raise HTTPException(status_code=400, detail="categories must be a list")
+    host = body.get("host")
+    report = security_workbench.analyze(flows, categories=categories, host=host)
+    return report
+
+
+@app.post("/api/security-workbench/regression-suite")
+def generate_security_regression_suite(body: Dict):
+    """Generate portable JSON plus a Python replay-based regression runner."""
+    flows = _security_workbench_flows(body)
+    categories = body.get("categories")
+    host = body.get("host")
+    report = security_workbench.analyze(flows, categories=categories, host=host, store=False)
+    return security_workbench.build_regression_suite(
+        flows,
+        report=report,
+        name=(body.get("name") or "KittyProxy browser security regression").strip(),
+        include_sensitive=bool(body.get("include_sensitive", False)),
+    )
+
+
+@app.post("/api/security-workbench/replay")
+def replay_security_workbench_flow(body: Dict):
+    """Replay one captured flow and evaluate security assertions against the new response."""
+    flow_id = str((body or {}).get("flow_id") or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=400, detail="flow_id is required")
+    flows = flow_manager.get_security_flows(flow_ids=[flow_id], limit=1)
+    if not flows:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    original_flow = flows[0]
+    request_data = security_workbench.prepare_replay(original_flow, include_sensitive=True)
+    overrides = body.get("overrides") or {}
+    if not isinstance(overrides, dict):
+        raise HTTPException(status_code=400, detail="overrides must be an object")
+    if overrides.get("method"):
+        request_data["method"] = str(overrides["method"]).upper()
+    if overrides.get("url"):
+        request_data["url"] = str(overrides["url"])
+    if overrides.get("headers") is not None:
+        if not isinstance(overrides["headers"], dict):
+            raise HTTPException(status_code=400, detail="overrides.headers must be an object")
+        request_data["headers"] = {str(k): str(v) for k, v in overrides["headers"].items()}
+    if overrides.get("body_b64") is not None:
+        request_data["body_b64"] = str(overrides["body_b64"])
+    elif overrides.get("body") is not None:
+        request_data["body_b64"] = base64.b64encode(
+            str(overrides["body"]).encode("utf-8")
+        ).decode("ascii")
+
+    for name in ("host", "content-length", "connection", "proxy-connection", "transfer-encoding"):
+        request_data["headers"].pop(name, None)
+        request_data["headers"].pop(name.title(), None)
+    try:
+        request_body = base64.b64decode(request_data.get("body_b64") or "", validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid body_b64")
+    try:
+        timeout = max(1.0, min(float(body.get("timeout", 20)), 60.0))
+        proxy_port = int(body.get("proxy_port", 8080))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="timeout/proxy_port is invalid")
+    proxies = None
+    if body.get("through_proxy", True):
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    baseline_report = security_workbench.analyze([original_flow], store=False)
+    started = time.perf_counter()
+    try:
+        response = requests.request(
+            method=request_data["method"],
+            url=request_data["url"],
+            headers=request_data["headers"],
+            data=request_body,
+            proxies=proxies,
+            verify=bool(body.get("verify_tls", False)),
+            timeout=timeout,
+            allow_redirects=bool(body.get("allow_redirects", False)),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Replay failed: {e}")
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    response_body = response.content[:1_000_000]
+    try:
+        set_cookie_headers = response.raw.headers.getlist("Set-Cookie")
+    except Exception:
+        value = response.headers.get("Set-Cookie")
+        set_cookie_headers = [value] if value else []
+    replayed_flow = {
+        "id": f"{flow_id}-replay",
+        "method": request_data["method"],
+        "url": request_data["url"],
+        "status_code": response.status_code,
+        "is_websocket": response.status_code == 101,
+        "request": {
+            "headers": request_data["headers"],
+            "content_bs64": request_data.get("body_b64") or "",
+        },
+        "response": {
+            "headers": dict(response.headers),
+            "set_cookie_headers": set_cookie_headers,
+            "content_bs64": base64.b64encode(response_body).decode("ascii"),
+        },
+    }
+    replay_report = security_workbench.analyze([replayed_flow], store=False)
+    suite = security_workbench.build_regression_suite(
+        [original_flow],
+        report=baseline_report,
+        include_sensitive=True,
+    )
+    checks = suite.get("cases", [{}])[0].get("checks", []) if suite.get("cases") else []
+    assertion_result = security_workbench.evaluate_response(
+        checks,
+        {
+            "status_code": response.status_code,
+            "headers": dict(response.headers),
+            "set_cookie_headers": set_cookie_headers,
+            "body": response_body.decode("utf-8", errors="replace"),
+        },
+    )
+    baseline_rules = {item["rule_id"] for item in baseline_report.get("findings", [])}
+    replay_rules = {item["rule_id"] for item in replay_report.get("findings", [])}
+    return {
+        "status": "replayed",
+        "flow_id": flow_id,
+        "request": {
+            "method": request_data["method"],
+            "url": request_data["url"],
+        },
+        "response": {
+            "status_code": response.status_code,
+            "reason": response.reason,
+            "headers": dict(response.headers),
+            "body_bs64": base64.b64encode(response_body).decode("ascii"),
+            "body_length": len(response.content),
+            "body_truncated": len(response.content) > len(response_body),
+            "duration_ms": duration_ms,
+        },
+        "security_delta": {
+            "resolved_rules": sorted(baseline_rules - replay_rules),
+            "persisting_rules": sorted(baseline_rules & replay_rules),
+            "new_rules": sorted(replay_rules - baseline_rules),
+        },
+        "regression": assertion_result,
+    }
+
+
 # === REFLECTION CHECK (live URLs) ===
 class ReflectionCheckRequest(BaseModel):
     flow_id: str
@@ -2608,23 +2785,23 @@ async def websocket_collaboration(websocket: WebSocket, session_id: str):
     try:
         # Recevoir les informations du collaborateur
         data = await websocket.receive_json()
-        collaborator_name = data.get('name', 'Anonymous')
+        collaborator_name = data.get('name') or data.get('username', 'Anonymous')
         collaborator_color = data.get('color', '#2196f3')
+        collaborator_id = data.get('user_id') or data.get('userId') or websocket_id
         
         # Create or retrieve the session
         session = collaboration_manager.get_session(session_id)
         if not session:
-            # Create a new session if it doesn't exist
             session = collaboration_manager.create_session(
                 name=f"Session {session_id[:8]}",
-                owner_id=websocket_id,
-                target_url=data.get('target_url', '')
+                owner_id=collaborator_id,
+                target_url=data.get('target_url', ''),
+                session_id=session_id,
             )
-            session_id = session.id
         
         # Create the collaborator
         collaborator = Collaborator(
-            id=websocket_id,
+            id=collaborator_id,
             name=collaborator_name,
             color=collaborator_color,
             connected_at=time.time(),
@@ -2647,12 +2824,17 @@ async def websocket_collaboration(websocket: WebSocket, session_id: str):
                 'collaborators': [
                     {
                         'id': c.id,
+                        'user_id': c.id,
                         'name': c.name,
+                        'username': c.name,
                         'color': c.color,
                         'selected_flow': session.selected_flows.get(c.id)
                     }
                     for c in session.collaborators.values()
                 ],
+                'flows': list(session.shared_flows.values()),
+                'chat_messages': list(session.chat_messages),
+                'active_mirrors': list(session.active_mirrors),
                 'annotations': {
                     flow_id: [
                         {
@@ -2790,6 +2972,7 @@ async def handle_collaboration_message(session_id: str, websocket_id: str, data:
             await broadcast_to_session(session_id, websocket_id, {
                 'type': 'flow_selected',
                 'collaborator_id': collaborator_id,
+                'user_id': collaborator_id,
                 'flow_id': flow_id
             })
     
@@ -2855,6 +3038,8 @@ async def handle_collaboration_message(session_id: str, websocket_id: str, data:
         collaborator_id = collaboration_manager.get_collaborator_for_websocket(websocket_id)
         
         if flow:
+            if collaborator_id:
+                collaboration_manager.add_shared_flow(session_id, flow, collaborator_id)
             # Transmettre le flow complet avec l'ID du collaborateur
             message = {
                 'type': 'flow_added',
@@ -2866,6 +3051,26 @@ async def handle_collaboration_message(session_id: str, websocket_id: str, data:
                 message['userId'] = collaborator_id  # Alias pour compatibilité
             
             await broadcast_to_session(session_id, websocket_id, message)
+
+    elif msg_type == 'get_flows':
+        session = collaboration_manager.get_session(session_id)
+        if session:
+            websocket = active_websockets.get(websocket_id)
+            if websocket:
+                await websocket.send_json({
+                    'type': 'flows_list',
+                    'flows': list(session.shared_flows.values()),
+                })
+
+    elif msg_type == 'ai_results':
+        await broadcast_to_session(session_id, websocket_id, data)
+
+    elif msg_type == 'participant_name_change':
+        user_id = data.get('user_id')
+        new_name = data.get('new_name')
+        if user_id and new_name:
+            collaboration_manager.update_collaborator_name(session_id, user_id, new_name)
+            await broadcast_to_session(session_id, None, data)
     
     elif msg_type in ['screenshot', 'dom_snapshot', 'dom_diff']:
         # Messages de mirroring - les rediffuser comme mirror_data
@@ -2883,19 +3088,23 @@ async def handle_collaboration_message(session_id: str, websocket_id: str, data:
     elif msg_type == 'mirror_start':
         # Démarrer le mirroring via le WebSocket de collaboration
         collaborator_id = collaboration_manager.get_collaborator_for_websocket(websocket_id)
-        if collaborator_id:
+        user_id = data.get('user_id') or collaborator_id
+        if user_id:
+            collaboration_manager.set_mirror_active(session_id, user_id, True)
             await broadcast_to_session(session_id, None, {
                 'type': 'mirror_started',
-                'user_id': collaborator_id
+                'user_id': user_id
             })
     
     elif msg_type == 'mirror_stop':
         # Arrêter le mirroring
         collaborator_id = collaboration_manager.get_collaborator_for_websocket(websocket_id)
-        if collaborator_id:
+        user_id = data.get('user_id') or collaborator_id
+        if user_id:
+            collaboration_manager.set_mirror_active(session_id, user_id, False)
             await broadcast_to_session(session_id, None, {
                 'type': 'mirror_stopped',
-                'user_id': collaborator_id
+                'user_id': user_id
             })
     
     elif msg_type == 'chat_message':
@@ -2915,10 +3124,21 @@ async def handle_collaboration_message(session_id: str, websocket_id: str, data:
                     'content': content,
                     'created_at': time.time()
                 }
+                collaboration_manager.add_chat_message(session_id, message)
                 await broadcast_to_session(session_id, None, {
                     'type': 'chat_message',
                     'message': message
                 })
+    
+    elif msg_type in (
+        'repeater_tab_created', 'repeater_tab_update', 'repeater_tab_activated',
+        'repeater_tab_closed', 'repeater_cursor', 'repeater_sent',
+    ):
+        collaborator_id = collaboration_manager.get_collaborator_for_websocket(websocket_id)
+        relay = dict(data)
+        if collaborator_id and not relay.get('user_id'):
+            relay['user_id'] = collaborator_id
+        await broadcast_to_session(session_id, websocket_id, relay)
     
     elif msg_type == 'cursor_position':
         # Position du curseur pour le suivi en temps réel
@@ -3007,15 +3227,32 @@ def create_session(request: Dict):
     """Crée une nouvelle session collaborative"""
     name = request.get('name', 'New Session')
     target_url = request.get('target_url', '')
-    owner_id = str(uuid.uuid4())
+    owner_id = request.get('owner_id') or str(uuid.uuid4())
     
     session = collaboration_manager.create_session(name, owner_id, target_url)
     
     return {
+        'id': session.id,
         'session_id': session.id,
         'name': session.name,
         'target_url': session.target_url,
-        'owner_id': owner_id
+        'owner_id': owner_id,
+        'invite_code': session.id[:8].upper(),
+    }
+
+@app.get("/api/collaboration/sessions/invite/{code}")
+def get_collaboration_session_by_invite(code: str):
+    """Résout une session par code d'invitation (préfixe d'ID ou ID complet)."""
+    session = collaboration_manager.get_session_by_invite(code)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        'id': session.id,
+        'session_id': session.id,
+        'name': session.name,
+        'target_url': session.target_url,
+        'owner_id': session.owner_id,
+        'invite_code': session.id[:8].upper(),
     }
 
 @app.get("/api/collaboration/sessions")
@@ -3071,6 +3308,50 @@ def get_session_annotations(session_id: str):
             for flow_id, annotations in session.annotations.items()
         }
     }
+
+# === LOCAL AI ASSISTANT ===
+
+class AIAnalyzeRequest(BaseModel):
+    method: str = "GET"
+    url: str = ""
+    headers: Dict = {}
+    body: str = ""
+    response: Dict = {}
+    technologies: Dict = {}
+    endpoints: Dict = {}
+    parameters: Dict = {}
+
+@app.get("/api/ai/status")
+def ai_status():
+    """Check whether a local LLM (Ollama, LM Studio, etc.) is configured and reachable."""
+    cfg = load_ai_config()
+    status = local_ai_status(cfg)
+    return status
+
+@app.get("/api/ai/config")
+def ai_config():
+    """Return non-sensitive local AI configuration for the UI."""
+    cfg = load_ai_config()
+    return {
+        "enabled": cfg["enabled"],
+        "provider": cfg["provider"],
+        "base_url": cfg["base_url"],
+        "model": cfg["model"],
+    }
+
+@app.post("/api/ai/analyze")
+def ai_analyze(request: AIAnalyzeRequest):
+    """Analyze an HTTP flow using a local OpenAI-compatible LLM."""
+    try:
+        result = local_ai_analyze(request.model_dump())
+        return result
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"Failed to parse LLM response: {e}")
+    except Exception as e:
+        print(f"[AI] Local analysis error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Local AI analysis failed: {e}")
 
 # === WORKSPACE MANAGEMENT ENDPOINTS ===
 @app.get("/api/workspaces")
@@ -3335,6 +3616,23 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key)
     return f"{key[:4]}...{key[-4:]}"
+
+@app.get("/api/collab/mode")
+def collab_mode():
+    """Indique si la collaboration cloud (Pro) ou locale est disponible."""
+    api_key = _load_collab_api_key()
+    saas_available = False
+    if api_key:
+        try:
+            data = _validate_collab_api_key(api_key)
+            saas_available = bool(data.get("valid") and data.get("token"))
+        except HTTPException:
+            saas_available = False
+    return {
+        "saas_available": saas_available,
+        "local_available": True,
+        "recommended_mode": "saas" if saas_available else "local",
+    }
 
 @app.get("/api/collab/auth")
 def collab_auth():

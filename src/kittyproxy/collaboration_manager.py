@@ -7,8 +7,8 @@ Collaboration Manager - Gestion de la collaboration en temps réel
 
 import uuid
 import time
-from typing import Dict, List, Set, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Set, Optional, Any
+from dataclasses import dataclass, field
 from collections import defaultdict
 import threading
 
@@ -43,6 +43,9 @@ class SharedSession:
     collaborators: Dict[str, Collaborator]
     annotations: Dict[str, List[Annotation]]
     selected_flows: Dict[str, str]  # collaborator_id -> flow_id
+    shared_flows: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    chat_messages: List[Dict[str, Any]] = field(default_factory=list)
+    active_mirrors: Set[str] = field(default_factory=set)
 
 class CollaborationManager:
     """Gère les sessions collaboratives et la synchronisation"""
@@ -54,9 +57,15 @@ class CollaborationManager:
         self.websocket_to_collaborator: Dict[str, str] = {}  # websocket_id -> collaborator_id
         self.lock = threading.Lock()
     
-    def create_session(self, name: str, owner_id: str, target_url: str = "") -> SharedSession:
+    def create_session(
+        self,
+        name: str,
+        owner_id: str,
+        target_url: str = "",
+        session_id: Optional[str] = None,
+    ) -> SharedSession:
         """Crée une nouvelle session partagée"""
-        session_id = str(uuid.uuid4())
+        session_id = (session_id or str(uuid.uuid4())).strip()
         session = SharedSession(
             id=session_id,
             name=name,
@@ -65,7 +74,7 @@ class CollaborationManager:
             created_at=time.time(),
             collaborators={},
             annotations=defaultdict(list),
-            selected_flows={}
+            selected_flows={},
         )
         
         with self.lock:
@@ -105,6 +114,8 @@ class CollaborationManager:
                 # Retirer la sélection
                 if collaborator_id in session.selected_flows:
                     del session.selected_flows[collaborator_id]
+
+                session.active_mirrors.discard(collaborator_id)
             
             # Nettoyer les connexions
             if session_id in self.active_connections:
@@ -181,6 +192,67 @@ class CollaborationManager:
         """Récupère une session"""
         with self.lock:
             return self.sessions.get(session_id)
+
+    def get_session_by_invite(self, code: str) -> Optional[SharedSession]:
+        """Résout une session par ID complet ou préfixe (code d'invitation)."""
+        code = (code or "").strip().lower()
+        if not code:
+            return None
+        with self.lock:
+            session = self.sessions.get(code)
+            if session:
+                return session
+            for sid, session in self.sessions.items():
+                sid_lower = sid.lower()
+                if sid_lower == code or sid_lower.startswith(code):
+                    return session
+        return None
+
+    def add_shared_flow(self, session_id: str, flow: Dict[str, Any], user_id: Optional[str] = None) -> None:
+        """Enregistre un flow partagé dans la session."""
+        flow_id = flow.get("id")
+        if not flow_id:
+            return
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return
+            stored = dict(flow)
+            if user_id:
+                stored["shared_by_user_id"] = user_id
+                stored["user_id"] = user_id
+            session.shared_flows[flow_id] = stored
+
+    def add_chat_message(self, session_id: str, message: Dict[str, Any], max_messages: int = 200) -> None:
+        """Ajoute un message de chat à l'historique de la session."""
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return
+            session.chat_messages.append(message)
+            if len(session.chat_messages) > max_messages:
+                session.chat_messages = session.chat_messages[-max_messages:]
+
+    def set_mirror_active(self, session_id: str, user_id: str, active: bool) -> None:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return
+            if active:
+                session.active_mirrors.add(user_id)
+            else:
+                session.active_mirrors.discard(user_id)
+
+    def update_collaborator_name(self, session_id: str, user_id: str, new_name: str) -> bool:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return False
+            collaborator = session.collaborators.get(user_id)
+            if not collaborator:
+                return False
+            collaborator.name = new_name
+            return True
     
     def get_active_connections(self, session_id: str) -> Set[str]:
         """Récupère les IDs des connexions actives pour une session"""

@@ -574,6 +574,7 @@ function updateTopBarForView(viewId) {
     const viewTitles = {
         'browser': 'Browser',
         'analyze': 'Analyze',
+        'security-workbench': 'Browser Security Workbench',
         'intercept': 'Intercept',
         'modules': 'Kittysploit Modules',
         'plugins': 'Interception Plugins',
@@ -15898,7 +15899,62 @@ function normalizeCollabUrl(url) {
 let COLLABORATION_SERVER_URL = normalizeCollabUrl(localStorage.getItem('collaboration_server_url') || 'https://proxy.kittysploit.com');
 let COLLAB_API_TOKEN = localStorage.getItem('collaboration_api_token') || null;
 let collabAuthValid = false;
+let collabMode = 'saas'; // 'saas' | 'local'
 let collabContentDefaultHTML = null;
+
+function isLocalCollabMode() {
+    return collabMode === 'local';
+}
+
+function getLocalWsOrigin() {
+    const apiRoot = String(API_BASE).replace(/\/api\/?$/i, '');
+    if (/^https?:\/\//i.test(apiRoot)) {
+        const wsProto = apiRoot.startsWith('https') ? 'wss:' : 'ws:';
+        return `${wsProto}//${apiRoot.replace(/^https?:\/\//, '')}`;
+    }
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${wsProto}//${window.location.host}`;
+}
+
+function getCollabWebSocketUrl(sessionId) {
+    if (isLocalCollabMode()) {
+        return `${getLocalWsOrigin()}/ws/collaboration/${sessionId}`;
+    }
+    const wsProtocol = COLLABORATION_SERVER_URL.startsWith('https') ? 'wss:' : 'ws:';
+    const wsHost = COLLABORATION_SERVER_URL.replace('http://', '').replace('https://', '');
+    return `${wsProtocol}//${wsHost}/ws/v1/sessions/${sessionId}`;
+}
+
+function enableLocalCollabMode() {
+    collabMode = 'local';
+    collabAuthValid = false;
+    removeCollabApiOverlay();
+    updateCollabModeBadge();
+    const hint = document.getElementById('collab-local-mode-hint');
+    if (hint) hint.style.display = 'block';
+    const createBtn = document.getElementById('btn-create-collab-session') || document.querySelector('[onclick*="createCollaborationSession"]');
+    const createBtn2 = document.getElementById('collab-create-session-btn-2');
+    const joinBtn2 = document.getElementById('collab-join-session-btn-2');
+    if (createBtn) createBtn.disabled = false;
+    if (createBtn2) createBtn2.disabled = false;
+    if (joinBtn2) joinBtn2.disabled = false;
+}
+
+function updateCollabModeBadge() {
+    const badge = document.getElementById('collab-mode-badge');
+    if (!badge) return;
+    if (collabMode === 'local') {
+        badge.textContent = 'LOCAL';
+        badge.style.background = '#2e7d32';
+        badge.style.display = 'inline-block';
+    } else if (collabAuthValid) {
+        badge.textContent = 'PRO';
+        badge.style.background = '#ff4444';
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
 
 function renderCollabApiKeyRequired(message) {
     if (currentViewId !== 'collaborate') return;
@@ -15958,11 +16014,8 @@ async function ensureCollabAuth(forceRetry = false) {
         if (!res.ok) {
             const data = await res.json().catch(() => ({}));
             const errorMsg = data.detail || data.message || 'API key invalid or missing.';
-            renderCollabApiKeyRequired(errorMsg);
-            collabAuthValid = false;
-            // Marquer l'échec dans le cache (permanent jusqu'au rechargement)
-            localStorage.setItem('collab_auth_last_failed', 'true');
-            console.error('[COLLAB] Auth failed:', errorMsg);
+            enableLocalCollabMode();
+            console.warn('[COLLAB] Auth failed, using local collaboration mode:', errorMsg);
             return false;
         }
         const data = await res.json();
@@ -15974,14 +16027,17 @@ async function ensureCollabAuth(forceRetry = false) {
         // Si la validation réussit, on supprime le cache d'échec
         if (collabAuthValid) {
             localStorage.removeItem('collab_auth_last_failed');
+            collabMode = 'saas';
+            removeCollabApiOverlay();
+            const hint = document.getElementById('collab-local-mode-hint');
+            if (hint) hint.style.display = 'none';
             console.log('[COLLAB] Auth successful');
         } else {
-            // Si valid est false, on marque l'échec
             const errorMsg = data.detail || data.message || `API key invalid (valid: ${data.valid}, hasToken: ${!!data.token})`;
-            console.error('[COLLAB] Auth failed:', errorMsg);
-            localStorage.setItem('collab_auth_last_failed', 'true');
-            renderCollabApiKeyRequired(errorMsg);
+            console.warn('[COLLAB] Auth invalid, using local collaboration mode:', errorMsg);
+            enableLocalCollabMode();
         }
+        updateCollabModeBadge();
 
         if (data.server_url) {
             COLLABORATION_SERVER_URL = normalizeCollabUrl(data.server_url);
@@ -15993,11 +16049,8 @@ async function ensureCollabAuth(forceRetry = false) {
         }
         return collabAuthValid;
     } catch (e) {
-        console.error('[COLLAB] Auth error:', e);
-        renderCollabApiKeyRequired('Unable to validate API key.');
-        collabAuthValid = false;
-        // Marquer l'échec dans le cache (permanent jusqu'au rechargement)
-        localStorage.setItem('collab_auth_last_failed', 'true');
+        console.warn('[COLLAB] Auth error, using local collaboration mode:', e);
+        enableLocalCollabMode();
         return false;
     }
 }
@@ -16290,9 +16343,12 @@ function createCollaborationSession() {
 
 // Confirme la création de session
 async function confirmCreateSession() {
-    if (!collabAuthValid) {
-        renderCollabApiKeyRequired('API key required for collaboration.');
-        return;
+    if (!collabAuthValid && !isLocalCollabMode()) {
+        await ensureCollabAuth();
+        if (!collabAuthValid && !isLocalCollabMode()) {
+            renderCollabApiKeyRequired('API key required for cloud collaboration.');
+            return;
+        }
     }
     const nameInput = document.getElementById('modal-session-name');
     const name = nameInput ? nameInput.value.trim() : '';
@@ -16305,24 +16361,28 @@ async function confirmCreateSession() {
     closeModal('modal-create-session');
 
     try {
-        // Créer une session (pas besoin d'API key)
-        const apiUrl = `${COLLABORATION_SERVER_URL}/api/v1/sessions`;
+        const apiUrl = isLocalCollabMode()
+            ? `${API_BASE}/collaboration/sessions`
+            : `${COLLABORATION_SERVER_URL}/api/v1/sessions`;
 
-        const res = await fetch(apiUrl, {
+        const fetchOpts = {
             method: 'POST',
-            headers: collabHeaders({
-                'Content-Type': 'application/json'
-            }),
+            headers: isLocalCollabMode()
+                ? { 'Content-Type': 'application/json' }
+                : collabHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
                 name: name,
-                target_url: ''
+                target_url: '',
+                owner_id: currentUserId || `user_${Date.now()}`
             })
-        });
+        };
+
+        const res = await fetch(apiUrl, fetchOpts);
 
         if (res.ok) {
             const data = await res.json();
             currentSessionId = data.id || data.session_id;
-            currentUserId = data.owner_id || `user_${Date.now()}`;
+            currentUserId = data.owner_id || currentUserId || `user_${Date.now()}`;
             await joinCollaborationSession(currentSessionId);
         } else {
             const error = await res.json().catch(() => ({ detail: 'Unknown error' }));
@@ -16330,7 +16390,8 @@ async function confirmCreateSession() {
         }
     } catch (err) {
         console.error('Error creating session:', err);
-        showErrorModal('Connection error to collaboration server. Please ensure the SaaS server is running.');
+        const serverHint = isLocalCollabMode() ? 'KittyProxy server' : 'collaboration SaaS server';
+        showErrorModal(`Connection error to ${serverHint}. Please ensure it is running.`);
     }
 }
 
@@ -16346,9 +16407,12 @@ function joinCollaborationSession(sessionId = null) {
 
 // Confirme le join de session
 async function confirmJoinSession() {
-    if (!collabAuthValid) {
-        renderCollabApiKeyRequired('API key required for collaboration.');
-        return;
+    if (!collabAuthValid && !isLocalCollabMode()) {
+        await ensureCollabAuth();
+        if (!collabAuthValid && !isLocalCollabMode()) {
+            renderCollabApiKeyRequired('API key required for cloud collaboration.');
+            return;
+        }
     }
     const codeInput = document.getElementById('modal-invite-code');
     const code = codeInput ? codeInput.value.trim() : '';
@@ -16360,16 +16424,21 @@ async function confirmJoinSession() {
 
     closeModal('modal-join-session');
 
-    // Tenter d'abord de résoudre comme ID de session (UUID), puis comme code d'invitation
     try {
         const trimmedCode = code.trim();
         const normalizedCode = trimmedCode.toUpperCase();
+        const sessionHeaders = isLocalCollabMode()
+            ? { 'Content-Type': 'application/json' }
+            : collabHeaders({ 'Content-Type': 'application/json' });
 
         // 1) Vérifier si c'est directement un ID de session valide
         try {
-            const resById = await fetch(`${COLLABORATION_SERVER_URL}/api/v1/sessions/${trimmedCode}`, {
+            const sessionUrl = isLocalCollabMode()
+                ? `${API_BASE}/collaboration/sessions/${encodeURIComponent(trimmedCode)}`
+                : `${COLLABORATION_SERVER_URL}/api/v1/sessions/${trimmedCode}`;
+            const resById = await fetch(sessionUrl, {
                 method: 'GET',
-                headers: collabHeaders({ 'Content-Type': 'application/json' })
+                headers: sessionHeaders
             });
 
             if (resById.ok) {
@@ -16383,11 +16452,14 @@ async function confirmJoinSession() {
             console.warn(`[WARN] Error while checking session by ID: ${err.message}. Will try invite code.`);
         }
 
-        // 2) Essayer comme code d'invitation (quelle que soit la longueur)
+        // 2) Essayer comme code d'invitation
         console.log(`[DEBUG] Joining session with invite code: ${normalizedCode}`);
-        const res = await fetch(`${COLLABORATION_SERVER_URL}/api/v1/sessions/invite/${normalizedCode}`, {
+        const inviteUrl = isLocalCollabMode()
+            ? `${API_BASE}/collaboration/sessions/invite/${encodeURIComponent(normalizedCode)}`
+            : `${COLLABORATION_SERVER_URL}/api/v1/sessions/invite/${normalizedCode}`;
+        const res = await fetch(inviteUrl, {
             method: 'GET',
-            headers: collabHeaders({ 'Content-Type': 'application/json' })
+            headers: sessionHeaders
         });
 
         if (res.ok) {
@@ -16415,12 +16487,9 @@ async function doJoinCollaborationSession(sessionId) {
     if (!sessionId) return;
 
     try {
-        // Construire l'URL WebSocket (toujours utiliser le serveur SaaS)
-        const wsProtocol = COLLABORATION_SERVER_URL.startsWith('https') ? 'wss:' : 'ws:';
-        const wsHost = COLLABORATION_SERVER_URL.replace('http://', '').replace('https://', '');
-        const wsUrl = `${wsProtocol}//${wsHost}/ws/v1/sessions/${sessionId}`;
+        const wsUrl = getCollabWebSocketUrl(sessionId);
 
-        console.log('Connecting to WebSocket:', wsUrl);
+        console.log(`Connecting to WebSocket (${collabMode}):`, wsUrl);
         collaborationWebSocket = new WebSocket(wsUrl);
 
         collaborationWebSocket.onopen = () => {
@@ -16473,9 +16542,12 @@ async function doJoinCollaborationSession(sessionId) {
             console.log('WebSocket closed:', event.code, event.reason);
             if (event.code !== 1000) {
                 console.warn('Unexpected WebSocket closure');
-                if (event.code === 1006) {
-                    showErrorModal('Connection closed unexpectedly. Please ensure the server is running and the API key is correct.');
-                }
+            if (event.code === 1006) {
+                const hint = isLocalCollabMode()
+                    ? 'Connection closed unexpectedly. Ensure KittyProxy is running.'
+                    : 'Connection closed unexpectedly. Please ensure the server is running and the API key is correct.';
+                showErrorModal(hint);
+            }
             }
             leaveCollaborationSession();
         };
@@ -16516,6 +16588,13 @@ function handleCollaborationMessage(data) {
             updateSessionInfo(data.session);
             console.log('[Collaboration] session_joined, session data:', data.session);
 
+            // Historique chat inclus dans session_joined (mode local)
+            if (data.session && Array.isArray(data.session.chat_messages) && data.session.chat_messages.length > 0) {
+                collaborationMessages = [];
+                if (collabChatMessages) collabChatMessages.innerHTML = '';
+                data.session.chat_messages.forEach(msg => addChatMessage(msg));
+            }
+
             // Vérifier si le serveur renvoie les flows existants dans la session
             if (data.session && data.session.flows && Array.isArray(data.session.flows)) {
                 console.log('[Collaboration] Found', data.session.flows.length, 'flows in session data');
@@ -16529,13 +16608,17 @@ function handleCollaborationMessage(data) {
                 console.log('[Collaboration] No flows found in session data, flows:', data.session?.flows);
             }
 
-            // Charger l'historique du chat
-            loadChatHistory();
+            // Charger l'historique du chat (cloud uniquement)
+            if (!isLocalCollabMode()) {
+                loadChatHistory();
+            }
 
-            // Charger les flows existants partagés dans la session depuis les messages
-            setTimeout(() => {
-                loadExistingSharedFlows();
-            }, 500);
+            // Charger les flows existants partagés (cloud uniquement)
+            if (!isLocalCollabMode()) {
+                setTimeout(() => {
+                    loadExistingSharedFlows();
+                }, 500);
+            }
 
             // Demander au serveur de renvoyer tous les flows existants de la session
             // En envoyant un message pour demander les flows
@@ -16605,7 +16688,7 @@ function handleCollaborationMessage(data) {
             }
             break;
         case 'flow_selected':
-            highlightFlow(data.flow_id, data.user_id);
+            highlightFlow(data.flow_id, data.user_id || data.collaborator_id);
             // Optionnel: afficher une notification visuelle
             if (data.user_id !== currentUserId) {
                 const participant = collaborationParticipants.find(p => p.user_id === data.user_id);
@@ -16802,7 +16885,14 @@ function updateSessionInfo(session) {
     }
     if (collabInviteCode) {
         const sessionId = session.id || session.session_id || session.invite_code || currentSessionId || '';
-        collabInviteCode.textContent = sessionId ? `Session ID: ${sessionId}` : '';
+        const shortCode = session.invite_code || (sessionId ? sessionId.substring(0, 8).toUpperCase() : '');
+        if (isLocalCollabMode() && shortCode) {
+            collabInviteCode.textContent = `Invite: ${shortCode}`;
+            collabInviteCode.title = `Full session ID: ${sessionId}`;
+        } else {
+            collabInviteCode.textContent = sessionId ? `Session ID: ${sessionId}` : '';
+            collabInviteCode.title = '';
+        }
     }
     if (session.participants && Array.isArray(session.participants)) {
         collaborationParticipants = session.participants;
@@ -17847,9 +17937,101 @@ function initCollaborationTabs() {
 
 // === AI Assistant Functions ===
 let collabAIAccess = null;
+let collabAIMode = 'saas'; // 'saas' | 'local'
+let collabLocalAIStatus = null;
 let collabAIFlows = [];
 let collabCurrentAIFlow = null; // Flow actuellement analysé, utilisé pour tester les payloads
 let collabAIResults = {}; // {flowId: {suggestions, tech_stack, summary, next_steps}}
+
+function updateAIModeBadge() {
+    const badge = document.getElementById('collab-ai-badge');
+    if (!badge) return;
+    if (collabAIMode === 'local') {
+        badge.textContent = 'LOCAL';
+        badge.style.background = '#2e7d32';
+        badge.style.display = 'inline';
+    } else if (collabAIAccess && collabAIAccess.has_access) {
+        badge.textContent = 'PRO';
+        badge.style.background = '#ff4444';
+        badge.style.display = 'inline';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function enableLocalAIMode(status) {
+    collabAIMode = 'local';
+    collabLocalAIStatus = status || {};
+    collabAIAccess = { has_access: true, source: 'local' };
+    window.collabAIAccess = collabAIAccess;
+
+    const aiNoAccess = document.getElementById('collab-ai-no-access');
+    const aiMain = document.getElementById('collab-ai-main');
+    if (aiNoAccess) aiNoAccess.style.display = 'none';
+    if (aiMain) aiMain.style.display = 'flex';
+    updateAIQuotaDisplay({ local: true, model: status?.model });
+    updateAIModeBadge();
+}
+
+function enableSaaSAIMode(access) {
+    collabAIMode = 'saas';
+    collabAIAccess = access || { has_access: true };
+    window.collabAIAccess = collabAIAccess;
+
+    const aiNoAccess = document.getElementById('collab-ai-no-access');
+    const aiMain = document.getElementById('collab-ai-main');
+    if (collabAIAccess.has_access) {
+        if (aiNoAccess) aiNoAccess.style.display = 'none';
+        if (aiMain) aiMain.style.display = 'flex';
+        updateAIQuotaDisplay({
+            remaining: collabAIAccess.requests_remaining,
+            used: collabAIAccess.requests_used,
+            limit: collabAIAccess.requests_limit
+        });
+    } else {
+        if (aiNoAccess) aiNoAccess.style.display = 'flex';
+        if (aiMain) aiMain.style.display = 'none';
+        updateAIQuotaDisplay({ remaining: '-' });
+        updateAIConfigStatus();
+    }
+    updateAIModeBadge();
+}
+
+async function tryEnableLocalAI() {
+    try {
+        const res = await fetch(`${API_BASE}/ai/status`);
+        if (!res.ok) return null;
+        const status = await res.json();
+        collabLocalAIStatus = status;
+        if (status.available) {
+            enableLocalAIMode(status);
+            return status;
+        }
+        return status;
+    } catch (e) {
+        console.warn('[AI] Local AI status check failed:', e);
+        return null;
+    }
+}
+
+async function showAINoAccess(localStatus) {
+    const aiTab = document.getElementById('collab-tab-ai');
+    const aiNoAccess = document.getElementById('collab-ai-no-access');
+    const aiMain = document.getElementById('collab-ai-main');
+    if (aiTab) aiTab.style.display = 'flex';
+    if (aiNoAccess) aiNoAccess.style.display = 'flex';
+    if (aiMain) aiMain.style.display = 'none';
+    updateAIQuotaDisplay({ remaining: '-' });
+    updateAIModeBadge();
+
+    let msg = 'Cloud AI requires a paid plan.';
+    if (localStatus && !localStatus.available) {
+        msg += ` Local AI: ${localStatus.message || 'not available'}.`;
+    } else if (!localStatus) {
+        msg += ' Configure Ollama in config.toml to use local AI.';
+    }
+    updateAIConfigStatus(msg);
+}
 
 // Initialiser l'AI Assistant
 function initAIAssistant() {
@@ -17875,17 +18057,23 @@ function initAIAssistant() {
 async function checkAIAccess(sessionId) {
     if (!sessionId || aiAccessUnavailable) return;
 
+    const aiTab = document.getElementById('collab-tab-ai');
+    if (aiTab) aiTab.style.display = 'flex';
+
+    // Mode collaboration local : utiliser directement l'IA locale
+    if (isLocalCollabMode()) {
+        const localStatus = await tryEnableLocalAI();
+        if (!localStatus || !localStatus.available) {
+            await showAINoAccess(localStatus);
+        }
+        return;
+    }
+
     const sessionPathId = (sessionId || '').toLowerCase();
 
     try {
         // API key non requise côté serveur pour l'IA ; on garde 'public' pour compat mais on ne bloque pas si absente
         const apiKey = localStorage.getItem('collab_api_key') || 'public';
-
-        // Toujours afficher l'onglet AI pour permettre la configuration
-        const aiTab = document.getElementById('collab-tab-ai');
-        if (aiTab) {
-            aiTab.style.display = 'flex';
-        }
 
         const headers = {
             'Content-Type': 'application/json'
@@ -17906,48 +18094,38 @@ async function checkAIAccess(sessionId) {
             const data = await response.json();
             collabAIAccess = data || { has_access: true };
             if (collabAIAccess.has_access === undefined) collabAIAccess.has_access = true;
-            window.collabAIAccess = collabAIAccess;
-
-            // Afficher/masquer l'onglet AI
-            const aiNoAccess = document.getElementById('collab-ai-no-access');
-            const aiMain = document.getElementById('collab-ai-main');
 
             if (collabAIAccess.has_access) {
-                if (aiNoAccess) aiNoAccess.style.display = 'none';
-                if (aiMain) aiMain.style.display = 'flex';
-                updateAIQuotaDisplay({
-                    remaining: collabAIAccess.requests_remaining,
-                    used: collabAIAccess.requests_used,
-                    limit: collabAIAccess.requests_limit
-                });
+                enableSaaSAIMode(collabAIAccess);
             } else {
-                if (aiNoAccess) aiNoAccess.style.display = 'flex';
-                if (aiMain) aiMain.style.display = 'none';
-                updateAIQuotaDisplay({ remaining: '-' });
-                updateAIConfigStatus();
+                const localStatus = await tryEnableLocalAI();
+                if (!localStatus || !localStatus.available) {
+                    await showAINoAccess(localStatus);
+                }
+            }
+        } else if (response.status === 402) {
+            const localStatus = await tryEnableLocalAI();
+            if (!localStatus || !localStatus.available) {
+                await showAINoAccess(localStatus);
             }
         } else {
-            // En dev : ne pas bloquer l'IA, même si le check échoue ou 401
-            console.warn('[AI] Access check failed or unauthorized, enabling dev fallback. Status:', response.status);
-            collabAIAccess = { has_access: true };
-            window.collabAIAccess = collabAIAccess;
-            const aiNoAccess = document.getElementById('collab-ai-no-access');
-            const aiMain = document.getElementById('collab-ai-main');
-            if (aiNoAccess) aiNoAccess.style.display = 'none';
-            if (aiMain) aiMain.style.display = 'flex';
-            updateAIQuotaDisplay({ remaining: '-' });
-            updateAIConfigStatus('AI access enabled (dev fallback)', response.status === 404 ? 'warning' : 'info');
+            // En dev : tenter l'IA locale, sinon fallback dev
+            console.warn('[AI] Access check failed, trying local AI. Status:', response.status);
+            const localStatus = await tryEnableLocalAI();
+            if (!localStatus || !localStatus.available) {
+                enableSaaSAIMode({ has_access: true });
+                updateAIConfigStatus('AI access enabled (dev fallback)', response.status === 404 ? 'warning' : 'info');
+            }
         }
     } catch (error) {
         console.error('[AI] Error checking access:', error);
-        // Afficher l'interface de configuration en cas d'erreur
-        const aiTab = document.getElementById('collab-tab-ai');
-        const aiNoAccess = document.getElementById('collab-ai-no-access');
-        const aiMain = document.getElementById('collab-ai-main');
-        if (aiTab) aiTab.style.display = 'flex';
-        if (aiNoAccess) aiNoAccess.style.display = 'flex';
-        if (aiMain) aiMain.style.display = 'none';
-        updateAIConfigStatus(`Connection error: ${error.message}. Make sure the collaboration server is running on ${COLLABORATION_SERVER_URL}`);
+        const localStatus = await tryEnableLocalAI();
+        if (!localStatus || !localStatus.available) {
+            const aiTab = document.getElementById('collab-tab-ai');
+            if (aiTab) aiTab.style.display = 'flex';
+            await showAINoAccess(localStatus);
+            updateAIConfigStatus(`Connection error: ${error.message}. Configure local AI in config.toml or ensure the collaboration server is running.`);
+        }
     }
 }
 
@@ -17968,6 +18146,20 @@ function updateAIConfigStatus(message) {
         html += `<div style="margin-bottom: 8px; color: #d32f2f;"><strong>API Key:</strong> Not configured</div>`;
     }
     html += `<div style="margin-bottom: 8px;"><strong>Server URL:</strong> <code style="background: #fff; padding: 2px 6px; border-radius: 3px; font-size: 11px;">${serverUrl}</code></div>`;
+
+    if (collabLocalAIStatus) {
+        const localColor = collabLocalAIStatus.available ? '#2e7d32' : '#d32f2f';
+        html += `<div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e0e0e0;">`;
+        html += `<div style="margin-bottom: 4px;"><strong>Local AI:</strong> <span style="color: ${localColor};">${collabLocalAIStatus.available ? 'Available' : 'Unavailable'}</span></div>`;
+        if (collabLocalAIStatus.model) {
+            html += `<div style="font-size: 11px;">Model: <code>${escapeHtml(collabLocalAIStatus.model)}</code> @ ${escapeHtml(collabLocalAIStatus.base_url || '')}</div>`;
+        }
+        if (!collabLocalAIStatus.available && collabLocalAIStatus.message) {
+            html += `<div style="font-size: 11px; color: #d32f2f; margin-top: 4px;">${escapeHtml(collabLocalAIStatus.message)}</div>`;
+        }
+        html += `<div style="font-size: 11px; color: #888; margin-top: 6px;">Configure in <code>config.toml</code>: [AI] enabled, base_url, model</div>`;
+        html += `</div>`;
+    }
 
     if (message) {
         html += `<div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e0e0e0; color: #d32f2f;">${escapeHtml(message)}</div>`;
@@ -18057,9 +18249,24 @@ async function configureAIAPIKey() {
 }
 
 // Mettre à jour l'affichage du quota IA (used / remaining)
-function updateAIQuotaDisplay({ used, remaining, limit } = {}) {
+function updateAIQuotaDisplay({ used, remaining, limit, local, model } = {}) {
     const elemRemaining = document.getElementById('collab-ai-requests-remaining');
     const elemUsed = document.getElementById('collab-ai-requests-used');
+    const quotaRow = elemRemaining?.parentElement?.parentElement;
+
+    if (local || collabAIMode === 'local') {
+        const quotaUsed = document.getElementById('collab-ai-quota-used');
+        const quotaRemaining = document.getElementById('collab-ai-quota-remaining');
+        if (quotaUsed) quotaUsed.innerHTML = `<strong>Local</strong> (${escapeHtml(model || collabLocalAIStatus?.model || 'LLM')})`;
+        if (quotaRemaining) quotaRemaining.innerHTML = '<strong>Unlimited</strong>';
+        if (quotaRow) quotaRow.title = 'Local AI — no request limit';
+        return;
+    }
+
+    const quotaUsed = document.getElementById('collab-ai-quota-used');
+    const quotaRemaining = document.getElementById('collab-ai-quota-remaining');
+    if (quotaUsed) quotaUsed.innerHTML = `<strong id="collab-ai-requests-used">-</strong> used`;
+    if (quotaRemaining) quotaRemaining.innerHTML = `<strong id="collab-ai-requests-remaining">-</strong> remaining`;
 
     const safeRemaining = remaining !== undefined && remaining !== null ? remaining : '-';
     let safeUsed = used !== undefined && used !== null ? used : '-';
@@ -18068,8 +18275,11 @@ function updateAIQuotaDisplay({ used, remaining, limit } = {}) {
         safeUsed = Math.max(0, Number(limit) - Number(safeRemaining));
     }
 
-    if (elemRemaining) elemRemaining.textContent = safeRemaining;
-    if (elemUsed) elemUsed.textContent = safeUsed;
+    const usedEl = document.getElementById('collab-ai-requests-used');
+    const remainingEl = document.getElementById('collab-ai-requests-remaining');
+    if (remainingEl) remainingEl.textContent = safeRemaining;
+    if (usedEl) usedEl.textContent = safeUsed;
+    if (quotaRow) quotaRow.title = '';
 }
 
 // Historique IA (stocké localement)
@@ -18532,6 +18742,85 @@ function loadAIFlowsList() {
     }
 }
 
+// Appeler l'API d'analyse IA (SaaS ou local selon le mode)
+async function callAIAnalyze(analyzePayload) {
+    if (collabAIMode === 'local') {
+        const localRes = await fetch(`${API_BASE}/ai/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(analyzePayload)
+        });
+        if (!localRes.ok) {
+            const err = await localRes.json().catch(() => ({}));
+            throw new Error(err.detail || `Local AI failed (HTTP ${localRes.status})`);
+        }
+        const data = await localRes.json();
+        updateAIQuotaDisplay({ local: true, model: collabLocalAIStatus?.model });
+        return data;
+    }
+
+    const apiKey = localStorage.getItem('collab_api_key');
+    const aiFetchHeaders = { 'Content-Type': 'application/json' };
+    if (COLLAB_API_TOKEN) {
+        aiFetchHeaders['Authorization'] = `Bearer ${COLLAB_API_TOKEN}`;
+    } else if (apiKey) {
+        aiFetchHeaders['X-API-Key'] = apiKey;
+    }
+
+    const response_api = await fetch(`${COLLABORATION_SERVER_URL}/api/v1/sessions/${currentSessionId}/ai/analyze`, {
+        method: 'POST',
+        headers: aiFetchHeaders,
+        body: JSON.stringify(analyzePayload)
+    });
+
+    if (response_api.status === 402) {
+        const errData = await response_api.json().catch(() => ({}));
+        const localStatus = await tryEnableLocalAI();
+        if (localStatus?.available) {
+            showToast('Cloud AI unavailable — using local AI', 'info');
+            return callAIAnalyze(analyzePayload);
+        }
+        updateAIQuotaDisplay({
+            remaining: errData.requests_remaining,
+            used: errData.requests_used,
+            limit: errData.requests_limit
+        });
+        const err = new Error(errData.detail || 'AI Assistant requires a paid plan.');
+        err.code = 402;
+        throw err;
+    }
+
+    if (response_api.status === 429) {
+        const errData = await response_api.json().catch(() => ({}));
+        updateAIQuotaDisplay({
+            remaining: errData.requests_remaining,
+            used: errData.requests_used,
+            limit: errData.requests_limit
+        });
+        const err = new Error(errData.detail || 'AI request limit exceeded.');
+        err.code = 429;
+        throw err;
+    }
+
+    if (!response_api.ok) {
+        const err = await response_api.json().catch(() => ({}));
+        updateAIQuotaDisplay({
+            remaining: err.requests_remaining,
+            used: err.requests_used,
+            limit: err.requests_limit
+        });
+        throw new Error(err.detail || `HTTP ${response_api.status}`);
+    }
+
+    const data = await response_api.json();
+    updateAIQuotaDisplay({
+        remaining: data.requests_remaining,
+        used: data.requests_used,
+        limit: data.requests_limit
+    });
+    return data;
+}
+
 // Analyser un flow avec l'IA
 async function analyzeFlowWithAI(flow) {
     if (!currentSessionId) {
@@ -18564,9 +18853,6 @@ async function analyzeFlowWithAI(flow) {
     analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; animation: spin 1s linear infinite; display: inline-block; color: #888; margin-bottom: 16px;">sync</span><p style="margin: 0; color: #666; font-size: 14px;">Analyzing with AI...</p></div>';
 
     try {
-        // Pour le moment, l'API key est optionnelle
-        const apiKey = localStorage.getItem('collab_api_key');
-
         // Préparer les données du flow enrichies
         const requestHeaders = {};
         if (flow.request && flow.request.headers) {
@@ -18651,87 +18937,26 @@ async function analyzeFlowWithAI(flow) {
             discovered_endpoints: (flow.discovered_endpoints || []).slice(0, 30)
         };
 
-        const aiFetchHeaders = {
-            'Content-Type': 'application/json'
+        const analyzePayload = {
+            method: flow.method || 'GET',
+            url: flow.url || '',
+            headers: requestHeaders,
+            body: body,
+            response: {
+                status: responseStatus,
+                headers: responseHeaders,
+                content: response
+            },
+            technologies: technologies,
+            endpoints: endpoints,
+            parameters: {
+                query: queryParams,
+                body: bodyParams
+            }
         };
-        if (COLLAB_API_TOKEN) {
-            aiFetchHeaders['Authorization'] = `Bearer ${COLLAB_API_TOKEN}`;
-        } else if (apiKey) {
-            aiFetchHeaders['X-API-Key'] = apiKey;
-        }
 
-        const response_api = await fetch(`${COLLABORATION_SERVER_URL}/api/v1/sessions/${currentSessionId}/ai/analyze`, {
-            method: 'POST',
-            headers: aiFetchHeaders,
-            body: JSON.stringify({
-                method: flow.method || 'GET',
-                url: flow.url || '',
-                headers: requestHeaders,
-                body: body,
-                response: {
-                    status: responseStatus,
-                    headers: responseHeaders,
-                    content: response
-                },
-                technologies: technologies,
-                endpoints: endpoints,
-                parameters: {
-                    query: queryParams,
-                    body: bodyParams
-                }
-            })
-        });
+        const data = await callAIAnalyze(analyzePayload);
 
-        if (response_api.status === 402) {
-            const data = await response_api.json().catch(() => ({}));
-            updateAIQuotaDisplay({
-                remaining: data.requests_remaining,
-                used: data.requests_used,
-                limit: data.requests_limit
-            });
-            showAppAlert(data.detail || 'AI Assistant requires a paid plan. Please upgrade your plan to access this feature.');
-            analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #ccc; margin-bottom: 16px; display: block;">lock</span><p style="margin: 0; color: #666; font-size: 14px;">Upgrade required</p></div>';
-            // Restaurer l'état normal du bouton
-            if (flow && flow.id) {
-                updateAnalyzeButtonState(flow.id, false);
-            }
-            return;
-        }
-
-        if (response_api.status === 429) {
-            const errorData = await response_api.json().catch(() => ({}));
-            updateAIQuotaDisplay({
-                remaining: errorData.requests_remaining,
-                used: errorData.requests_used,
-                limit: errorData.requests_limit
-            });
-            showAppAlert(errorData.detail || 'AI request limit exceeded. Please upgrade your plan.');
-            analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #d32f2f; margin-bottom: 16px; display: block;">error</span><p style="margin: 0; color: #666; font-size: 14px;">Request limit exceeded</p></div>';
-            // Restaurer l'état normal du bouton
-            if (flow && flow.id) {
-                updateAnalyzeButtonState(flow.id, false);
-            }
-            return;
-        }
-
-        if (!response_api.ok) {
-            const err = await response_api.json().catch(() => ({}));
-            updateAIQuotaDisplay({
-                remaining: err.requests_remaining,
-                used: err.requests_used,
-                limit: err.requests_limit
-            });
-            throw new Error(err.detail || `HTTP ${response_api.status}`);
-        }
-
-        const data = await response_api.json();
-
-        // Mettre à jour le quota si présent dans la réponse
-        updateAIQuotaDisplay({
-            remaining: data.requests_remaining,
-            used: data.requests_used,
-            limit: data.requests_limit
-        });
         // Sauvegarder dans l'historique local
         addAIHistoryEntry({
             url: flow.url,
@@ -18780,12 +19005,11 @@ async function analyzeFlowWithAI(flow) {
         }
 
         renderAISuggestions(data.suggestions, data.tech_stack, data.summary, data.next_steps);
-        updateAIQuotaDisplay({
-            remaining: data.requests_remaining,
-            used: data.requests_used,
-            limit: data.requests_limit
-        });
-        collabAIAccess.requests_remaining = data.requests_remaining;
+        if (collabAIMode === 'local') {
+            updateAIQuotaDisplay({ local: true, model: collabLocalAIStatus?.model });
+        } else if (collabAIAccess) {
+            collabAIAccess.requests_remaining = data.requests_remaining;
+        }
 
         // Restaurer l'état normal du bouton après succès
         if (flow && flow.id) {
@@ -18794,7 +19018,16 @@ async function analyzeFlowWithAI(flow) {
 
     } catch (error) {
         console.error('[AI] Error analyzing flow:', error);
-        analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #d32f2f; margin-bottom: 16px; display: block;">error</span><p style="margin: 0; color: #666; font-size: 14px;">Error analyzing flow. Please try again.</p></div>';
+        if (error.code === 402) {
+            showAppAlert(error.message);
+            analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #ccc; margin-bottom: 16px; display: block;">lock</span><p style="margin: 0; color: #666; font-size: 14px;">Upgrade required — or configure local AI in config.toml</p></div>';
+        } else if (error.code === 429) {
+            showAppAlert(error.message);
+            analysisContainer.innerHTML = '<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #d32f2f; margin-bottom: 16px; display: block;">error</span><p style="margin: 0; color: #666; font-size: 14px;">Request limit exceeded</p></div>';
+        } else {
+            const hint = collabAIMode === 'local' ? 'Check that Ollama is running and the model is loaded.' : 'Please try again.';
+            analysisContainer.innerHTML = `<div style="text-align: center; padding: 60px 20px;"><span class="material-symbols-outlined" style="font-size: 40px; color: #d32f2f; margin-bottom: 16px; display: block;">error</span><p style="margin: 0; color: #666; font-size: 14px;">${escapeHtml(error.message || 'Error analyzing flow.')}</p><p style="margin: 8px 0 0; color: #888; font-size: 12px;">${hint}</p></div>`;
+        }
         // Restaurer l'état normal du bouton en cas d'erreur
         if (flow && flow.id) {
             updateAnalyzeButtonState(flow.id, false);
@@ -20728,7 +20961,7 @@ function updateChatAuthorNames(userId, newName) {
 }
 
 async function loadChatHistory() {
-    if (!currentSessionId) return;
+    if (!currentSessionId || isLocalCollabMode()) return;
 
     try {
         const res = await fetch(`${COLLABORATION_SERVER_URL}/api/v1/sessions/${currentSessionId}/messages?limit=100`, {
@@ -20758,8 +20991,8 @@ async function loadChatHistory() {
 
 // Charger les flows existants partagés dans la session et les résultats IA
 async function loadExistingSharedFlows() {
-    if (!currentSessionId) {
-        console.log('[Collaboration] No session ID, cannot load existing flows');
+    if (!currentSessionId || isLocalCollabMode()) {
+        if (!currentSessionId) console.log('[Collaboration] No session ID, cannot load existing flows');
         return;
     }
 

@@ -8,6 +8,7 @@
     <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <link rel="stylesheet" href="style.css">
     <link rel="stylesheet" href="api_tester.css">
+    <link rel="stylesheet" href="security_workbench.css">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fira+Code:wght@400;500&display=swap">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
@@ -90,6 +91,9 @@
             </div>
             <div class="nav-item" data-view="analyze" data-label="Analyze" title="Analyze">
                 <span class="material-symbols-outlined">analytics</span>
+            </div>
+            <div class="nav-item" data-view="security-workbench" data-label="Security Workbench" title="Browser Security Workbench">
+                <span class="material-symbols-outlined">security</span>
             </div>
             <div class="nav-item" data-view="websocket" data-label="WebSocket" title="WebSocket">
                 <span class="material-symbols-outlined">hub</span>
@@ -375,6 +379,79 @@
                     </div>
                     <div id="detail-content" class="detail-content">
                         <div style="padding: 20px; color: #666; text-align: center;">Select a flow to view details</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Browser Security Workbench -->
+        <div id="security-workbench-view" class="view-section" style="display: none;">
+            <div class="top-bar">
+                <div>
+                    <h2>Browser Security Workbench</h2>
+                    <div class="sw-subtitle">DOM, CSP, headers, cookies, auth, WebSockets, GraphQL and ASVS 5.0.0</div>
+                </div>
+                <div class="sw-top-actions">
+                    <button id="sw-export-json-btn" class="btn btn-secondary" disabled>
+                        <span class="material-symbols-outlined">data_object</span>
+                        Regression JSON
+                    </button>
+                    <button id="sw-export-python-btn" class="btn btn-secondary" disabled>
+                        <span class="material-symbols-outlined">terminal</span>
+                        Python test
+                    </button>
+                    <button id="sw-scan-btn" class="btn btn-primary">
+                        <span class="material-symbols-outlined">radar</span>
+                        Scan captured flows
+                    </button>
+                </div>
+            </div>
+
+            <div class="sw-toolbar">
+                <input id="sw-host-filter" class="sw-input" type="text" placeholder="Host filter (optional)">
+                <select id="sw-severity-filter" class="sw-input">
+                    <option value="">All severities</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                </select>
+                <select id="sw-category-filter" class="sw-input">
+                    <option value="">All categories</option>
+                    <option value="dom">DOM sinks</option>
+                    <option value="csp">CSP</option>
+                    <option value="headers">Headers</option>
+                    <option value="cookies">Cookies</option>
+                    <option value="auth">Auth flows</option>
+                    <option value="websocket">WebSockets</option>
+                    <option value="graphql">GraphQL</option>
+                </select>
+                <input id="sw-search-filter" class="sw-input sw-search" type="search" placeholder="Filter findings…">
+                <span id="sw-scan-status" class="sw-scan-status">Ready</span>
+            </div>
+
+            <div id="sw-summary" class="sw-summary">
+                <div class="sw-metric"><span>Critical</span><strong id="sw-critical-count">0</strong></div>
+                <div class="sw-metric"><span>High</span><strong id="sw-high-count">0</strong></div>
+                <div class="sw-metric"><span>Total findings</span><strong id="sw-total-count">0</strong></div>
+                <div class="sw-metric"><span>Flows analyzed</span><strong id="sw-flow-count">0</strong></div>
+                <div class="sw-metric"><span>ASVS controls mapped</span><strong id="sw-asvs-count">0</strong></div>
+            </div>
+
+            <div class="sw-workspace">
+                <div class="sw-findings-pane">
+                    <div class="sw-pane-title">
+                        <span>Actionable findings</span>
+                        <span id="sw-visible-count" class="sw-count-chip">0</span>
+                    </div>
+                    <div id="sw-findings-list" class="sw-findings-list">
+                        <div class="sw-empty">Scan captured browser traffic to build the security map.</div>
+                    </div>
+                </div>
+                <div id="sw-detail-pane" class="sw-detail-pane">
+                    <div class="sw-empty sw-detail-empty">
+                        <span class="material-symbols-outlined">policy</span>
+                        <p>Select a finding to inspect evidence, remediation, ASVS mapping and replay.</p>
                     </div>
                 </div>
             </div>
@@ -672,6 +749,7 @@
         <div id="collaborate-view" class="view-section" style="display: none;">
             <div class="top-bar">
                 <h2 id="collab-session-name">Collaboration</h2>
+                <span id="collab-mode-badge" style="display: none; background: #2e7d32; color: white; border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: 600; vertical-align: middle;">LOCAL</span>
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <button id="collab-leave-session-btn" class="btn btn-secondary" style="display: none; padding: 8px 12px; gap: 6px; align-items: center;">
                         <span class="material-symbols-outlined" style="font-size: 18px;">logout</span>
@@ -688,6 +766,9 @@
                     <h2 style="color: #444; font-size: 2rem; margin: 0;">Real-Time Collaboration</h2>
                     <p style="color: #666; font-size: 1rem; margin: 0 0 12px 0; line-height: 1.5;">
                         Work in team on your pentest sessions. Share the flows, discuss and collaborate in real-time.
+                    </p>
+                    <p id="collab-local-mode-hint" style="display: none; color: #2e7d32; font-size: 0.9rem; margin: 0 0 12px 0; padding: 10px 14px; background: #f0f7f0; border-radius: 6px; max-width: 480px;">
+                        <strong>Local mode</strong> — sessions run on this KittyProxy instance. Share the invite code with teammates on the same network. Configure <code>[AI]</code> in config.toml for local AI analysis.
                     </p>
                     <div id="collaboration-actions" style="display: flex; gap: 10px; margin-top: 6px; justify-content: center; flex-wrap: wrap;">
                         <button id="collab-create-session-btn-2" class="btn btn-primary" style="display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px;">
@@ -808,7 +889,15 @@
                             <div id="collab-ai-no-access" style="display: none; padding: 40px; text-align: center; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;">
                                 <span class="material-symbols-outlined" style="font-size: 64px; color: #ccc; margin-bottom: 16px;">lock</span>
                                 <h3 style="margin: 0 0 8px 0; color: #333;">AI Assistant - Configuration Required</h3>
-                                <p style="margin: 0 0 24px 0; color: #666; max-width: 500px;">To use the AI Assistant, you need to configure an API key with AI access enabled.</p>
+                                <p style="margin: 0 0 12px 0; color: #666; max-width: 500px;">Cloud AI requires a paid plan. You can also use a <strong>local LLM</strong> (Ollama, LM Studio) without subscription.</p>
+                                <div style="margin: 0 0 24px 0; padding: 12px 16px; background: #f0f7f0; border: 1px solid #c8e6c9; border-radius: 6px; max-width: 500px; text-align: left; font-size: 12px; color: #333;">
+                                    <div style="font-weight: 600; margin-bottom: 6px;">Local AI setup (config.toml)</div>
+                                    <pre style="margin: 0; font-family: Consolas, monospace; font-size: 11px; white-space: pre-wrap;">[AI]
+enabled = true
+base_url = "http://127.0.0.1:11434"
+model = "llama3.2"</pre>
+                                    <div style="margin-top: 6px; color: #666;">Then run: <code>ollama pull llama3.2</code></div>
+                                </div>
                                 <div style="display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;">
                                     <button id="collab-ai-create-key-btn" class="btn btn-primary" style="padding: 10px 20px;">
                                         <span class="material-symbols-outlined" style="font-size: 18px; vertical-align: middle; margin-right: 6px;">add</span>
@@ -831,9 +920,9 @@
                                     <div style="padding: 16px; border-bottom: 1px solid var(--border-color); flex-shrink: 0;">
                                         <h3 style="margin: 0; font-size: 14px; font-weight: 600;">Select Flow to Analyze</h3>
                                         <div style="font-size: 11px; color: #666; margin-top: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                                            <span><strong id="collab-ai-requests-used">-</strong> used</span>
+                                            <span id="collab-ai-quota-used"><strong id="collab-ai-requests-used">-</strong> used</span>
                                             <span aria-hidden="true" style="color:#999;">•</span>
-                                            <span><strong id="collab-ai-requests-remaining">-</strong> remaining</span>
+                                            <span id="collab-ai-quota-remaining"><strong id="collab-ai-requests-remaining">-</strong> remaining</span>
                                         </div>
                                     </div>
                                     <div id="collab-ai-flows-list" style="flex: 1; overflow-y: auto; padding: 8px;">
@@ -2261,6 +2350,7 @@
 
     <script src="/kittyproxy-config.js"></script>
     <script src="app.js?v=18"></script>
+    <script src="security_workbench.js?v=1"></script>
 </body>
 
 </html>

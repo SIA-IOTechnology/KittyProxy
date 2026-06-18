@@ -12,6 +12,7 @@ HTTP/HTTPS intercepting proxy with a web UI, packaged as a **UI** extension for 
 - **Plugins** — Extensible interception pipeline (header modification, payload injection, URL blocklist, and more)
 - **KittySploit modules** — Discover, suggest, configure, and run framework modules directly from a captured flow
 - **Security tooling** — Parameter fuzzing, reflection checks, IDOR tests, JWT crack/sign, side-channel helpers
+- **Browser Security Workbench** — Correlates DOM sinks, CSP, browser headers, cookies, auth flows, WebSockets, and GraphQL with versioned OWASP ASVS 5.0.0 mappings
 - **Collaboration** — Shared sessions, flow sync, annotations, and browser mirroring over WebSockets
 - **Workspaces** — Switch between KittySploit workspace contexts from the proxy UI
 - **UI extensions** — Load optional front-end extensions via a small manifest API
@@ -66,6 +67,25 @@ python src/main.py
 3. Open the web UI at **`http://127.0.0.1:8443`** (or the host/port you configured).
 
 Set `KITTYSPLOIT_HOME` to the framework install directory if auto-detection fails.
+
+### Browser Security Workbench
+
+Open the **Security Workbench** tab after capturing browser traffic. A scan produces:
+
+- deduplicated findings with redacted evidence, confidence, remediation, affected flow IDs, and versioned ASVS mappings;
+- replay from the captured request, followed by a resolved/persisting/new finding delta and automated assertions;
+- portable regression artifacts as JSON or a standalone Python `requests` runner. Authentication values are replaced with environment placeholders by default.
+
+The generated runner accepts `KITTYPROXY_TEST_PROXY` for replay through a proxy and `KITTYPROXY_VERIFY_TLS=0` for an explicitly trusted local interception certificate.
+
+The matching API endpoints are:
+
+- `POST /api/security-workbench/analyze`
+- `GET /api/security-workbench/report`
+- `POST /api/security-workbench/replay`
+- `POST /api/security-workbench/regression-suite`
+
+The workbench uses passive, heuristic evidence from captured traffic. Its ASVS mapping is an aid to verification planning, not a compliance certification.
 
 ## Project layout
 
