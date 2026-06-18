@@ -500,13 +500,12 @@ function switchView(viewId, navItem = null) {
 
     // Collaboration tab: validate auth; otherwise remove overlay
     if (viewId === 'collaborate') {
-        ensureCollabAuth();
-        // Synchroniser l'état visuel (no-session vs active-session)
-        if (currentSessionId) {
-            showCollaborationSession();
-        } else {
-            hideCollaborationSession();
-        }
+        ensureCollabAuth().then(() => {
+            if (currentViewId === 'collaborate') {
+                syncCollaborationViewState();
+            }
+        });
+        syncCollaborationViewState();
     } else {
         removeCollabApiOverlay();
     }
@@ -16065,7 +16064,6 @@ function collabHeaders(extra = {}) {
 
 function removeCollabApiOverlay() {
     const content = document.getElementById('collaboration-content');
-    const noSession = document.getElementById('collab-no-session');
     if (content && collabContentDefaultHTML) {
         content.innerHTML = collabContentDefaultHTML;
         collabContentDefaultHTML = null;
@@ -16075,7 +16073,7 @@ function removeCollabApiOverlay() {
         content.style.justifyContent = '';
         content.style.alignItems = '';
     }
-    if (noSession) noSession.style.display = 'flex';
+    syncCollaborationViewState();
 }
 
 // Validate API key on load (async; rest of UI will gate on collabAuthValid)
@@ -16870,6 +16868,14 @@ function hideCollaborationSession() {
     if (collabCreateBtn) collabCreateBtn.style.display = 'block';
     if (collabJoinBtn) collabJoinBtn.style.display = 'block';
     resetCollaborationHeader();
+}
+
+function syncCollaborationViewState() {
+    if (currentSessionId) {
+        showCollaborationSession();
+    } else {
+        hideCollaborationSession();
+    }
 }
 
 // Remet le header collaboration à l'état par défaut
